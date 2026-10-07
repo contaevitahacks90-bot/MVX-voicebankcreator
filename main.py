@@ -1,560 +1,488 @@
 import io
-import json
 import math
 import os
-import tempfile
-import time
-import tkinter as tk
 import wave
 import zipfile
-from pathlib import PurePosixPath
-from tkinter import filedialog, messagebox
 
-try:
-    import winsound
-except ImportError:
-    winsound = None
-
-try:
-    import customtkinter as ctk
-    import numpy as np
-    from PIL import Image
-    from scipy.signal import butter, lfilter, resample
-except ImportError as exc:
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror(
-        "Dependência ausente",
-        f"Não foi possível iniciar o editor: {exc}\n\n"
-        "Instale as dependências com:\n"
-        "pip install customtkinter Pillow numpy scipy",
-    )
-    root.destroy()
-    raise SystemExit(1) from exc
+import numpy as np
+import streamlit as st
+from PIL import Image, UnidentifiedImageError
+from scipy.ndimage import zoom
+from scipy.signal import butter, lfilter
 
 
-ctk.set_appearance_mode("Dark")
+st.set_page_config(
+    page_title="MVX VoiceBank Creator",
+    page_icon="mxveditor.ico",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #121212; }
+    h1, h2, h3, p, label, .stSlider { color: #ffffff !important; }
+    .stButton > button {
+        background-color: #39FF14 !important;
+        color: #000000 !important;
+        font-weight: bold !important;
+        border: none !important;
+        width: 100% !important;
+        height: 45px !important;
+    }
+    .stButton > button:hover { background-color: #2EE610 !important; color: #000000 !important; }
+    .import-btn > div > button { background-color: #FFF000 !important; color: #000000 !important; }
+    .import-btn > div > button:hover { background-color: #CCFF00 !important; }
+    .stTextArea > div > div > textarea {
+        background-color: #1A1A1A !important;
+        color: #39FF14 !important;
+        font-family: 'Consolas', monospace !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-class MvxCreatorApp(ctk.CTk):
-    BG = "#121212"
-    PANEL = "#1E1E1E"
-    GREEN = "#39FF14"
-    YELLOW = "#FFF000"
+SESSION_KEYS = (
+    "tela",
+    "zip_bytes",
+    "linhas_oto_cruas",
+    "nome_arquivo_zip",
+    "dados_oto",
+    "lista_audios",
+    "audio_selecionado",
+    "encoding",
+)
 
-    def __init__(self):
-        super().__init__()
-        self.title("MVX VoiceBank Creator")
-        self.geometry("960x700")
-        self.minsize(900, 620)
-        self.configure(fg_color=self.BG)
+for key in SESSION_KEYS:
+    if key not in st.session_state:
+        default = 1 if key == "tela" else None
+        if key == "dados_oto":
+            default = {}
+        elif key == "lista_audios":
+            default = []
+        elif key == "audio_selecionado":
+            default = ""
+        elif key == "encoding":
+            default = "UTF-8"
+        st.session_state[key] = default
 
-        self.source_zip = None
-        self.oto_bytes = b""
-        self.oto_data = {}
-        self.audio_files = []
-        self.icon_path = ""
-        self.image_path = ""
-        self.fullscreen = False
-        self.preview_dir = tempfile.TemporaryDirectory(prefix="mvx-preview-")
-        self.preview_path = None
-        self._build_ui()
-        self.bind("<F11>", self._toggle_fullscreen)
-        self.bind("<Escape>", self._leave_fullscreen)
-        self.protocol("WM_DELETE_WINDOW", self._close)
 
-    def _build_ui(self):
-        self.grid_columnconfigure(0, weight=4, minsize=360)
-        self.grid_columnconfigure(1, weight=6, minsize=500)
-        self.grid_rowconfigure(0, weight=1)
+def interpretar_oto_ini(conteudo: str) -> dict[str, dict[str, str]]:
+    dados: dict[str, dict[str, str]] = {}
+    for linha in conteudo.splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith(";") or "=" not in linha:
+            continue
 
-        left = ctk.CTkFrame(self, fg_color=self.PANEL, corner_radius=0)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-        ctk.CTkButton(
-            left, text="⛶", width=35, command=self._toggle_fullscreen,
-            fg_color="#1A1A1A", border_color="#333333", border_width=1,
-        ).pack(anchor="w", padx=15, pady=15)
-        ctk.CTkLabel(
-            left, text="MVX VoiceBank Creator",
-            font=ctk.CTkFont(size=20, weight="bold"), text_color=self.YELLOW,
-        ).pack(anchor="w", padx=20, pady=(0, 10))
-        status_frame = ctk.CTkFrame(left, fg_color=self.BG, border_color=self.GREEN, border_width=1)
-        status_frame.pack(fill="x", padx=20, pady=10)
-        self.status_label = ctk.CTkLabel(
-            status_frame, text="Aguardando importação do pacote de voz... 🟢",
-            text_color="white", wraplength=330, justify="left",
+        nome_wav, dados_linha = [parte.strip() for parte in linha.split("=", 1)]
+        parametros = [parametro.strip() for parametro in dados_linha.split(",")]
+        if not nome_wav:
+            continue
+
+        alias = parametros[0] if parametros and parametros[0] else ""
+        consonant = parametros[1] if len(parametros) > 1 and parametros[1] else "0"
+        dados[nome_wav] = {"alias": alias, "consonant": consonant}
+
+    return dados
+
+
+def _normalizar_audio(audio_data: np.ndarray, sampwidth: int) -> np.ndarray:
+    if sampwidth == 1:
+        return (audio_data.astype(np.float32) - 128.0) * 256.0
+    if sampwidth == 2:
+        return audio_data.astype(np.float32)
+    if sampwidth == 3:
+        samples = audio_data.reshape(-1, 3)
+        return (
+            samples.astype(np.int32)
+            .dot(np.array([1, 256, 65536], dtype=np.int32))
+            .astype(np.float32)
         )
-        self.status_label.pack(padx=12, pady=12, fill="x")
-        self.flow = ctk.CTkFrame(left, fg_color="transparent")
-        self.flow.pack(expand=True, fill="both", padx=20, pady=10)
-        self._show_import()
+    if sampwidth == 4:
+        return audio_data.view(np.int32).astype(np.float32)
+    raise ValueError(f"Formato de áudio não suportado: {sampwidth} bytes por amostra")
 
-        right = ctk.CTkFrame(self, fg_color=self.BG, corner_radius=0)
-        right.grid(row=0, column=1, sticky="nsew", padx=25, pady=20)
-        ctk.CTkLabel(
-            right, text="PAINEL DE PROCESSAMENTO DIGITAL (VOICER ADJUSTER)",
-            font=ctk.CTkFont(size=14, weight="bold"), text_color=self.GREEN, wraplength=470,
-        ).pack(anchor="w", pady=(5, 5))
-        self.audio_combo = ctk.CTkComboBox(right, values=["Importe um pacote ZIP primeiro"])
-        self.audio_combo.set("Importe um pacote ZIP primeiro")
-        self.audio_combo.pack(fill="x", pady=(4, 12))
-        self.audio_combo.configure(state="disabled")
 
-        self.pitch_label, self.pitch = self._add_slider(right, "Nota musical: 0.0 semitons", -6, 6, 0, 24, self._pitch_changed)
-        self.air_label, self.air = self._add_slider(right, "Ar na voz: 0%", 0, 0.6, 0, 60, self._air_changed)
-        self.formant_label, self.formant = self._add_slider(right, "Timbre vocal: 1.00x", 0.85, 1.15, 1, 60, self._formant_changed)
-        self.gender_label, self.gender = self._add_slider(right, "Fator de gênero: 1.00", 0.8, 1.2, 1, 80, self._gender_changed)
-        self.growl_label, self.growl = self._add_slider(right, "Growl: 0%", 0, 1, 0, 100, self._growl_changed)
-        self.natural_label, self.naturalness = self._add_slider(right, "Naturalidade: 100%", 0, 1, 1, 100, self._natural_changed)
-        self.sliders = (self.pitch, self.air, self.formant, self.gender, self.growl, self.naturalness)
-        self.preview_button = ctk.CTkButton(
-            right, text="PROCESSAR E OUVIR PREVIEW", command=self._play_preview,
-            state="disabled", fg_color="transparent", text_color=self.GREEN,
-            border_color=self.GREEN, border_width=1,
-        )
-        self.preview_button.pack(fill="x", pady=4)
-        self.export_button = ctk.CTkButton(
-            right, text="COMPACTAR E EXPORTAR BANCO MAXIVLOID", command=self._export,
-            state="disabled", fg_color=self.GREEN, text_color="black",
-        )
-        self.export_button.pack(fill="x", pady=(4, 0))
+def processar_audio(
+    audio_bytes_in: bytes,
+    dados_oto: dict[str, dict[str, str]],
+    nome_wav_puro: str,
+    p_pitch: float,
+    p_air: float,
+    p_formant: float,
+    p_gender: float,
+    p_growl: float,
+    p_naturalness: float,
+) -> bytes:
+    try:
+        with wave.open(io.BytesIO(audio_bytes_in), "rb") as w_in:
+            params = w_in.getparams()
+            frames = w_in.readframes(params.nframes)
+    except wave.Error as exc:
+        raise ValueError("O arquivo de áudio não é um WAV válido.") from exc
 
-    @staticmethod
-    def _add_slider(parent, label, minimum, maximum, initial, steps, callback):
-        text = ctk.CTkLabel(parent, text=label, text_color="white")
-        text.pack(anchor="w", pady=(5, 1))
-        slider = ctk.CTkSlider(
-            parent, from_=minimum, to=maximum, number_of_steps=steps,
-            button_color="#39FF14", progress_color="#39FF14", command=callback,
-        )
-        slider.set(initial)
-        slider.pack(fill="x", pady=(0, 9))
-        slider.configure(state="disabled")
-        return text, slider
+    sample_count = len(frames) // params.sampwidth
+    audio_data = np.frombuffer(frames, dtype=np.uint8 if params.sampwidth == 1 else np.dtype(f"<i{params.sampwidth}")).astype(np.float32)
+    audio_data = _normalizar_audio(audio_data, params.sampwidth)
 
-    def _toggle_fullscreen(self, event=None):
-        self.fullscreen = not self.fullscreen
-        self.attributes("-fullscreen", self.fullscreen)
-        return "break"
+    try:
+        consonante_ms = float(dados_oto.get(nome_wav_puro, {}).get("consonant", "0"))
+    except ValueError:
+        consonante_ms = 0.0
 
-    def _leave_fullscreen(self, event=None):
-        if self.fullscreen:
-            self.fullscreen = False
-            self.attributes("-fullscreen", False)
-        return "break"
+    ponto_corte = min(int((consonante_ms / 1000.0) * params.framerate), len(audio_data))
+    consonante_chunk = audio_data[:ponto_corte]
+    vogal_chunk = audio_data[ponto_corte:]
 
-    def _clear_flow(self):
-        for widget in self.flow.winfo_children():
-            widget.destroy()
+    if len(vogal_chunk) == 0:
+        audio_final = audio_data
+    else:
+        if p_naturalness > 0.05:
+            freq_vibrato = 5.6 + np.random.normal(0.0, 0.4)
+            amplitude_vibrato = 0.022 * p_naturalness
+            tempo = np.arange(len(vogal_chunk), dtype=np.float32) / params.framerate
+            pontos_vibrato = np.sin(2.0 * math.pi * freq_vibrato * tempo) * amplitude_vibrato
+            indices_organicos = np.clip(
+                np.arange(len(vogal_chunk), dtype=np.float32)
+                + pontos_vibrato * params.framerate * 0.01,
+                0,
+                len(vogal_chunk) - 1,
+            ).astype(np.int32)
+            vogal_chunk = vogal_chunk[indices_organicos]
 
-    def _show_import(self):
-        self._clear_flow()
-        ctk.CTkButton(
-            self.flow, text="Importar pacote ZIP [oto.ini requerido]", height=45,
-            fg_color=self.YELLOW, text_color="black", command=self._import_zip,
-        ).pack(fill="x", pady=80)
+        pitch_factor = 2 ** (p_pitch / 12.0)
+        if pitch_factor != 1.0:
+            vogal_chunk = zoom(vogal_chunk, 1.0 / pitch_factor)
 
-    def _show_encoding(self):
-        self._clear_flow()
-        self.status_label.configure(text="Confira a visualização do oto.ini e selecione o encoding.")
-        ctk.CTkLabel(self.flow, text="Visualização do oto.ini:", text_color="white").pack(anchor="w")
-        self.preview_text = tk.Text(
-            self.flow, height=8, bg=self.BG, fg=self.GREEN, insertbackground="white",
-            font=("Consolas", 10),
-        )
-        self.preview_text.pack(fill="x", pady=(0, 10))
-        self.encoding_combo = ctk.CTkComboBox(
-            self.flow, values=["UTF-8", "Shift-JIS"], command=self._update_oto_preview,
-        )
-        self.encoding_combo.set("UTF-8")
-        self.encoding_combo.pack(fill="x", pady=(0, 15))
-        ctk.CTkButton(
-            self.flow, text="CONTINUAR ➔", fg_color=self.GREEN, text_color="black",
-            command=self._confirm_encoding,
-        ).pack(fill="x")
-        self._update_oto_preview("UTF-8")
+        if p_formant != 1.0 or p_gender != 1.0:
+            fator_total = p_formant * p_gender
+            janela, passo = 1024, 256
+            janela_hann = np.hanning(janela)
+            espectros = []
+            max_inicio = max(0, len(vogal_chunk) - janela)
+            for inicio in range(0, max_inicio + 1, passo):
+                segmento = vogal_chunk[inicio : inicio + janela]
+                if len(segmento) < janela:
+                    segmento = np.pad(segmento, (0, janela - len(segmento)))
+                espectro = np.fft.rfft(segmento * janela_hann)
+                indices = np.clip(np.arange(len(espectro)) * fator_total, 0, len(espectro) - 1).astype(np.int32)
+                espectro_modificado = espectro[indices]
+                espectro_modificado = np.pad(
+                    espectro_modificado,
+                    (0, len(espectro) - len(espectro_modificado)),
+                ) if len(espectro_modificado) < len(espectro) else espectro_modificado[: len(espectro)]
+                espectros.append(np.fft.irfft(espectro_modificado))
 
-    def _show_identity(self):
-        self._clear_flow()
-        self.status_label.configure(text="Configure a identidade do personagem.")
-        ctk.CTkLabel(
-            self.flow, text="IDENTIDADE DO PERSONAGEM (MAXIVLOID)",
-            font=ctk.CTkFont(size=12, weight="bold"), text_color=self.YELLOW,
-        ).pack(anchor="w", pady=(0, 5))
-        ctk.CTkLabel(self.flow, text="Nome:", text_color="white").pack(anchor="w")
-        self.name_entry = ctk.CTkEntry(self.flow, fg_color=self.BG, text_color="white")
-        self.name_entry.pack(fill="x", pady=(0, 5))
-        ctk.CTkLabel(self.flow, text="Autor / Desenvolvedor:", text_color="white").pack(anchor="w")
-        self.author_entry = ctk.CTkEntry(self.flow, fg_color=self.BG, text_color="white")
-        self.author_entry.pack(fill="x", pady=(0, 8))
-        ctk.CTkButton(
-            self.flow, text="Carregar ícone (máx. 1280x1280)",
-            command=self._select_icon,
-        ).pack(fill="x", pady=2)
-        self.icon_label = ctk.CTkLabel(self.flow, text="", text_color="grey")
-        self.icon_label.pack(anchor="w")
-        ctk.CTkButton(
-            self.flow, text="Carregar ilustração", command=self._select_image,
-        ).pack(fill="x", pady=2)
-        self.image_label = ctk.CTkLabel(self.flow, text="", text_color="grey")
-        self.image_label.pack(anchor="w")
-        ctk.CTkLabel(self.flow, text="README.txt (opcional):", text_color="white").pack(anchor="w")
-        self.readme_text = tk.Text(
-            self.flow, height=4, bg=self.BG, fg="white", insertbackground="white",
-        )
-        self.readme_text.pack(fill="x")
+            if espectros:
+                recon = np.zeros(len(vogal_chunk), dtype=np.float32)
+                for indice, bloco in enumerate(espectros):
+                    inicio = indice * passo
+                    fim = min(inicio + janela, len(recon))
+                    recon[inicio:fim] += bloco[: fim - inicio]
+                vogal_chunk = recon
 
-    @staticmethod
-    def _zip_matches(archive, basename):
-        return [
-            item.filename for item in archive.infolist()
-            if not item.is_dir()
-            and PurePosixPath(item.filename.replace("\\", "/")).name.casefold() == basename.casefold()
-        ]
-
-    def _import_zip(self):
-        filename = filedialog.askopenfilename(
-            title="Selecionar pacote de voz ZIP",
-            filetypes=[("Arquivos ZIP", "*.zip")],
-            parent=self,
-        )
-        if not filename:
-            return
-        try:
-            with zipfile.ZipFile(filename, "r") as archive:
-                corrupt_file = archive.testzip()
-                if corrupt_file:
-                    raise ValueError(f"Arquivo corrompido no ZIP: {corrupt_file}")
-                oto_matches = self._zip_matches(archive, "oto.ini")
-                if len(oto_matches) != 1:
-                    raise ValueError(f"Esperado um oto.ini; encontrados: {len(oto_matches)}.")
-                audio_files = [
-                    item.filename for item in archive.infolist()
-                    if not item.is_dir()
-                    and PurePosixPath(item.filename.replace("\\", "/")).suffix.casefold() == ".wav"
-                ]
-                if not audio_files:
-                    raise ValueError("O pacote não contém arquivos WAV.")
-                oto_bytes = archive.read(oto_matches[0])
-        except (OSError, zipfile.BadZipFile, RuntimeError, ValueError) as exc:
-            messagebox.showerror("Erro de leitura", f"Não foi possível validar o ZIP:\n{exc}", parent=self)
-            return
-
-        self.source_zip = filename
-        self.audio_files = audio_files
-        self.oto_bytes = oto_bytes
-        self.oto_data = {}
-        self._show_encoding()
-
-    def _update_oto_preview(self, encoding):
-        if not self.oto_bytes:
-            return
-        codec = "shift_jis" if encoding == "Shift-JIS" else "utf-8"
-        preview = self.oto_bytes.decode(codec, errors="replace")
-        self.preview_text.configure(state="normal")
-        self.preview_text.delete("1.0", tk.END)
-        self.preview_text.insert(tk.END, "\n".join(preview.splitlines()[:12]))
-        self.preview_text.configure(state="disabled")
-
-    @staticmethod
-    def _parse_oto(text):
-        parsed = {}
-        for line_number, line in enumerate(text.splitlines(), 1):
-            line = line.strip()
-            if not line or line.startswith(";") or "=" not in line:
-                continue
-            wav_name, raw_parameters = line.split("=", 1)
-            parameters = [part.strip() for part in raw_parameters.split(",")]
-            if not wav_name.strip() or len(parameters) < 6:
-                continue
-            try:
-                numbers = [float(value) for value in parameters[1:6]]
-            except ValueError as exc:
-                raise ValueError(f"Valor numérico inválido na linha {line_number}.") from exc
-            parsed[PurePosixPath(wav_name.replace("\\", "/")).name.casefold()] = {
-                "alias": parameters[0],
-                "offset": numbers[0],
-                "consonant": numbers[1],
-                "cutoff": numbers[2],
-                "preutterance": numbers[3],
-                "overlap": numbers[4],
-            }
-        if not parsed:
-            raise ValueError("oto.ini não contém nenhuma entrada válida.")
-        return parsed
-
-    def _confirm_encoding(self):
-        codec = "shift_jis" if self.encoding_combo.get() == "Shift-JIS" else "utf-8"
-        try:
-            self.oto_data = self._parse_oto(self.oto_bytes.decode(codec, errors="replace"))
-        except ValueError as exc:
-            messagebox.showerror("Erro de formato", str(exc), parent=self)
-            return
-        self.audio_combo.configure(values=self.audio_files, state="readonly")
-        self.audio_combo.set(self.audio_files[0])
-        for slider in self.sliders:
-            slider.configure(state="normal")
-        self.preview_button.configure(state="normal")
-        self.export_button.configure(state="normal")
-        self.status_label.configure(
-            text=f"Pronto: {len(self.audio_files)} WAVs e {len(self.oto_data)} entradas oto.ini."
-        )
-        self._show_identity()
-
-    def _select_icon(self):
-        self._select_image_file(icon=True)
-
-    def _select_image(self):
-        self._select_image_file(icon=False)
-
-    def _select_image_file(self, icon):
-        path = filedialog.askopenfilename(
-            title="Selecionar imagem",
-            filetypes=[("Imagens", "*.png *.jpg *.jpeg *.webp")],
-            parent=self,
-        )
-        if not path:
-            return
-        try:
-            with Image.open(path) as image:
-                width, height = image.size
-                image.verify()
-            if icon and (width > 1280 or height > 1280):
-                raise ValueError(f"O ícone excede o limite 1280x1280 ({width}x{height}).")
-        except (OSError, ValueError) as exc:
-            messagebox.showerror("Imagem inválida", str(exc), parent=self)
-            return
-        if icon:
-            self.icon_path = path
-            self.icon_label.configure(text=os.path.basename(path))
-        else:
-            self.image_path = path
-            self.image_label.configure(text=os.path.basename(path))
-
-    @staticmethod
-    def _decode_pcm(data, width, channels):
-        if width == 1:
-            audio = (np.frombuffer(data, dtype=np.uint8).astype(np.float32) - 128) / 128
-        elif width == 2:
-            audio = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768
-        elif width == 3:
-            raw = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3)
-            value = raw[:, 0].astype(np.int32) | (raw[:, 1].astype(np.int32) << 8) | (raw[:, 2].astype(np.int32) << 16)
-            value = np.where(value & 0x800000, value - 0x1000000, value)
-            audio = value.astype(np.float32) / 8388608
-        elif width == 4:
-            audio = np.frombuffer(data, dtype="<i4").astype(np.float32) / 2147483648
-        else:
-            raise ValueError(f"PCM de {width} bytes por amostra não é suportado.")
-        if channels > 1:
-            if audio.size % channels:
-                raise ValueError("Dados PCM incompletos para a quantidade de canais.")
-            audio = audio.reshape(-1, channels).mean(axis=1)
-        return audio
-
-    def _render_audio(self, samples, rate, filename):
-        pitch = 2 ** (self.pitch.get() / 12)
-        key = PurePosixPath(filename.replace("\\", "/")).name.casefold()
-        consonant_ms = max(0.0, self.oto_data.get(key, {}).get("consonant", 0.0))
-        split = min(int(consonant_ms * rate / 1000), len(samples))
-        consonant = samples[:split]
-        vowel = samples[split:].copy()
-        if len(vowel) > 1 and not math.isclose(pitch, 1.0, rel_tol=1e-5):
-            vowel = resample(vowel, max(1, round(len(vowel) / pitch))).astype(np.float32)
-
-        formant = self.formant.get() * self.gender.get()
-        if len(vowel) > 1 and not math.isclose(formant, 1.0, rel_tol=1e-5):
-            spectrum = np.fft.rfft(vowel)
-            old_bins = np.arange(len(spectrum))
-            new_bins = np.clip(old_bins * formant, 0, len(spectrum) - 1)
-            real = np.interp(new_bins, old_bins, spectrum.real)
-            imag = np.interp(new_bins, old_bins, spectrum.imag)
-            vowel = np.fft.irfft(real + 1j * imag, n=len(vowel)).astype(np.float32)
-
-        growl = self.growl.get()
-        if len(vowel) and growl > 0:
-            peak = max(float(np.max(np.abs(vowel))), 1e-8)
-            time_axis = np.arange(len(vowel)) / rate
-            modulation = np.sin(2 * math.pi * 60 * time_axis) * growl * 0.12
-            saturated = np.arctan((vowel / peak) * (1 + growl * 2.5)) / (math.pi / 2)
-            vowel = (vowel * (1 - growl * 0.25) + saturated * growl * 0.25) * (1 + modulation)
-
-        air = self.air.get()
-        cutoff = min(3800.0, rate * 0.45)
-        if len(vowel) and air > 0 and cutoff > 0:
-            b, a = butter(4, cutoff / (rate / 2), btype="high")
-            noise = lfilter(b, a, np.random.normal(0, 0.02, len(vowel)))
-            envelope = np.abs(vowel)
-            noise *= envelope / max(float(np.max(envelope)), 1e-8)
-            vowel = vowel * (1 - air * 0.2) + noise * air
-
-        naturalness = self.naturalness.get()
-        if len(vowel) and naturalness > 0:
-            time_axis = np.arange(len(vowel)) / rate
-            vibrato = 1 + np.sin(2 * math.pi * 5.6 * time_axis) * naturalness * 0.00015
-            vowel = vowel * vibrato
-        rendered = np.concatenate((consonant, vowel))
-        peak = float(np.max(np.abs(rendered))) if rendered.size else 0.0
-        if peak > 0.98:
-            rendered *= 0.98 / peak
-        return np.clip(rendered * 32767, -32768, 32767).astype("<i2")
-
-    def _play_preview(self):
-        if winsound is None:
-            messagebox.showerror("Áudio", "A reprodução de preview requer Windows.", parent=self)
-            return
-        filename = self.audio_combo.get()
-        if filename not in self.audio_files:
-            messagebox.showerror("Áudio", "Selecione uma amostra WAV.", parent=self)
-            return
-        try:
-            with zipfile.ZipFile(self.source_zip, "r") as archive:
-                audio_bytes = archive.read(filename)
-            with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
-                if wav.getcomptype() != "NONE":
-                    raise ValueError("O WAV precisa usar PCM sem compressão.")
-                rate = wav.getframerate()
-                samples = self._decode_pcm(
-                    wav.readframes(wav.getnframes()), wav.getsampwidth(), wav.getnchannels()
-                )
-            if not samples.size:
-                raise ValueError("O WAV está vazio.")
-            rendered = self._render_audio(samples, rate, filename)
-            output = io.BytesIO()
-            with wave.open(output, "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(rate)
-                wav.writeframes(rendered.tobytes())
-            winsound.PlaySound(None, winsound.SND_PURGE)
-            if self.preview_path and os.path.exists(self.preview_path):
-                os.remove(self.preview_path)
-            self.preview_path = os.path.join(self.preview_dir.name, f"preview_{time.time_ns()}.wav")
-            with open(self.preview_path, "wb") as preview_file:
-                preview_file.write(output.getvalue())
-            winsound.PlaySound(self.preview_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, wave.Error) as exc:
-            messagebox.showerror("Erro de áudio", f"Não foi possível processar a amostra:\n{exc}", parent=self)
-
-    @staticmethod
-    def _metadata_value(value):
-        return str(value).replace("\r", " ").replace("\n", " ").strip()
-
-    def _export(self):
-        output_path = filedialog.asksaveasfilename(
-            title="Exportar banco de voz MVX",
-            defaultextension=".zip",
-            filetypes=[("Arquivo ZIP", "*.zip")],
-            initialfile="banco_maxivloid_final.zip",
-            parent=self,
-        )
-        if not output_path:
-            return
-        if os.path.normcase(os.path.abspath(output_path)) == os.path.normcase(
-            os.path.abspath(self.source_zip)
-        ):
-            messagebox.showerror("Exportação", "Escolha um destino diferente do ZIP de origem.", parent=self)
-            return
-
-        name = self._metadata_value(self.name_entry.get()) or "MaxiVloid_Character"
-        author = self._metadata_value(self.author_entry.get()) or "MVX_Developer"
-        image_name = os.path.basename(self.image_path) if self.image_path else ""
-        icon_name = os.path.basename(self.icon_path) if self.icon_path else ""
-        readme = self.readme_text.get("1.0", tk.END).strip()
-        replaced = {"mxai.ini", "character.txt", "character.yaml"}
-        if readme:
-            replaced.add("readme.txt")
-        replaced.update(filename.casefold() for filename in (image_name, icon_name) if filename)
-
-        mxai = [
-            "[MxAi_Configuration]",
-            "EngineCompatible=MaximizeVoiceSynthesizerMobile",
-            "GlobalType=MaxiVloid",
-            f"GlobalPitchShift={self.pitch.get():.2f}",
-            f"GlobalAirRatio={self.air.get():.2f}",
-            f"GlobalFormantShift={self.formant.get():.2f}",
-            f"GlobalGenderFactor={self.gender.get():.2f}",
-            f"GlobalGrowlAmount={self.growl.get():.2f}",
-            f"GlobalNaturalness={self.naturalness.get():.2f}",
-            "",
-            "[Amostras_Calibradas]",
-        ]
-        for filename in self.audio_files:
-            base = PurePosixPath(filename.replace("\\", "/")).name
-            oto = self.oto_data.get(base.casefold(), {})
-            mxai.append(
-                f"{base}=Pitch={self.pitch.get():.2f},Air={self.air.get():.2f},"
-                f"Formant={self.formant.get():.2f},Gender={self.gender.get():.2f},"
-                f"Growl={self.growl.get():.2f},Naturalness={self.naturalness.get():.2f},"
-                f"ProtectConsonant={oto.get('consonant', 0)}"
+        if p_growl > 0.0:
+            tempo_g = np.arange(len(vogal_chunk), dtype=np.float32) / params.framerate
+            mod_ventricular = np.sin(2.0 * math.pi * 60.0 * tempo_g) * (p_growl * 0.28)
+            pico_maximo = np.max(np.abs(vogal_chunk)) + 1e-5
+            sinal_saturado = np.arctan(vogal_chunk / pico_maximo * (1.0 + p_growl * 2.5)) * pico_maximo
+            vogal_chunk = (
+                vogal_chunk * (1.0 - p_growl * 0.4)
+                + sinal_saturado * p_growl * 0.5
+                + vogal_chunk * mod_ventricular
             )
-        character_txt = [
-            "type=MaxiVloid",
-            f"name={name}",
-            f"image={image_name}",
-            f"author={author}",
-            f"icon={icon_name}",
-            "version=Maximize_Voice_2.0",
-        ]
-        character_yaml = [
-            "type: MaxiVloid",
-            f"name: {json.dumps(name, ensure_ascii=False)}",
-            f"author: {json.dumps(author, ensure_ascii=False)}",
-            f"image: {json.dumps(image_name, ensure_ascii=False)}",
-            f"icon: {json.dumps(icon_name, ensure_ascii=False)}",
-            "voice_engine: MaximizeVoiceSynthesizerMobile",
-        ]
 
+        if p_air > 0.0:
+            ruido_base = np.random.normal(0.0, 1000.0, len(vogal_chunk)).astype(np.float32)
+            nyquist = 0.5 * params.framerate
+            b, a = butter(4, 3800.0 / nyquist, btype="high")
+            sopro_puro = lfilter(b, a, ruido_base)
+            envelope_vocal = np.abs(vogal_chunk)
+            pico_envelope = np.max(envelope_vocal) + 1e-5
+            sopro_modulado = sopro_puro * (envelope_vocal / pico_envelope)
+            vogal_chunk = vogal_chunk * (1.0 - p_air * 0.3) + sopro_modulado * p_air * 1.6
+
+        pico_onda = np.max(np.abs(vogal_chunk))
+        teto_maximo = 28000.0
+        if pico_onda > teto_maximo:
+            vogal_chunk = vogal_chunk * (teto_maximo / (pico_onda + 1e-5))
+
+        audio_final = np.clip(
+            np.concatenate((consonante_chunk, vogal_chunk)),
+            -32768.0,
+            32767.0,
+        ).astype(np.int16)
+
+    out_mem = io.BytesIO()
+    with wave.open(out_mem, "wb") as w_out:
+        w_out.setnchannels(params.nchannels)
+        w_out.setsampwidth(2)
+        w_out.setframerate(params.framerate)
+        w_out.writeframes(audio_final.tobytes())
+    return out_mem.getvalue()
+
+
+def _mostrar_tela_importacao():
+    st.subheader("Painel de Importação")
+    uploaded_file = st.file_uploader(
+        "Selecione o arquivo Zip contendo o banco de voz e o arquivo 'oto.ini'",
+        type=["zip"],
+    )
+
+    if uploaded_file is None:
+        return
+
+    zip_bytes = uploaded_file.read()
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+            nomes = z.namelist()
+            oto_nome = next(
+                (name for name in nomes if os.path.basename(name).lower() == "oto.ini"),
+                None,
+            )
+            if oto_nome is None:
+                st.error("Arquivo 'oto.ini' não foi encontrado dentro do arquivo ZIP fornecido.")
+                return
+
+            st.session_state.linhas_oto_cruas = z.read(oto_nome)
+            st.session_state.lista_audios = sorted(
+                name for name in nomes
+                if not name.endswith("/") and os.path.basename(name).lower().endswith(".wav")
+            )
+    except zipfile.BadZipFile:
+        st.error("O arquivo enviado não é um ZIP válido.")
+        return
+
+    st.session_state.zip_bytes = zip_bytes
+    st.session_state.nome_arquivo_zip = uploaded_file.name
+    st.session_state.audio_selecionado = ""
+    st.session_state.tela = 2
+    st.rerun()
+
+
+def _mostrar_tela_validacao():
+    st.subheader("Validação de Codificação do Pacote")
+    if st.session_state.linhas_oto_cruas is None:
+        st.session_state.tela = 1
+        st.rerun()
+
+    enc_opcao = st.selectbox("Selecione o formato de encoding do texto:", ["UTF-8", "Shift-JIS"])
+    st.session_state.encoding = enc_opcao
+    encoding_alvo = "shift_jis" if enc_opcao == "Shift-JIS" else "utf-8"
+    texto_decodificado = st.session_state.linhas_oto_cruas.decode(encoding_alvo, errors="ignore")
+    linhas_preview = "\n".join(texto_decodificado.splitlines()[:12])
+    st.text_area(
+        "Estrutura interna detectada no arquivo 'oto.ini':",
+        value=linhas_preview,
+        height=220,
+        disabled=True,
+    )
+
+    if st.button("CONFIRMAR CODIFICAÇÃO E AVANÇAR ➔"):
+        st.session_state.dados_oto = interpretar_oto_ini(
+            st.session_state.linhas_oto_cruas.decode(encoding_alvo, errors="ignore")
+        )
+        st.session_state.tela = 3
+        st.rerun()
+
+
+def _mostrar_tela_processamento():
+    st.subheader("Identidade Digital do Banco de Voz")
+    st.markdown("Formato de Metadados: MaxiVloid", unsafe_allow_html=True)
+
+    nome_ch = st.text_input("Nome do Character:", value="MaxiVloid_Character")
+    autor_ch = st.text_input("Autor / Desenvolvedor:", value="MVX_Developer")
+    uploaded_icon = st.file_uploader(
+        "Carregar Imagem de Ícone (máximo 1280x1280):",
+        type=["png", "jpg", "jpeg"],
+    )
+    uploaded_ilusr = st.file_uploader(
+        "Carregar Ilustração Completa do Avatar (.png/.jpg):",
+        type=["png", "jpg", "jpeg"],
+    )
+    readme_text = st.text_area(
+        "Conteúdo complementar para o README.txt (opcional):",
+        height=150,
+    )
+
+    icone_bytes = None
+    icone_nome = ""
+    if uploaded_icon is not None:
         try:
-            with zipfile.ZipFile(self.source_zip, "r") as source:
-                with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as output:
-                    for item in source.infolist():
-                        if item.is_dir():
-                            continue
-                        basename = PurePosixPath(item.filename.replace("\\", "/")).name.casefold()
-                        if basename not in replaced:
-                            output.writestr(item, source.read(item.filename))
-                    output.writestr("MxAi.ini", "\n".join(mxai))
-                    output.writestr("character.txt", "\n".join(character_txt))
-                    output.writestr("character.yaml", "\n".join(character_yaml))
-                    if readme:
-                        output.writestr("README.txt", readme)
-                    if self.icon_path:
-                        output.write(self.icon_path, icon_name)
-                    if self.image_path:
-                        output.write(self.image_path, image_name)
-        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
-            messagebox.showerror("Erro de exportação", str(exc), parent=self)
-            return
+            with Image.open(uploaded_icon) as img_ico:
+                if img_ico.width > 1280 or img_ico.height > 1280:
+                    st.error(
+                        f"Erro: o ícone deve ter no máximo 1280x1280 pixels; "
+                        f"a imagem possui {img_ico.width}x{img_ico.height}."
+                    )
+                else:
+                    uploaded_icon.seek(0)
+                    icone_bytes = uploaded_icon.getvalue()
+                    icone_nome = uploaded_icon.name
+        except UnidentifiedImageError:
+            st.error("A imagem do ícone não é válida.")
 
-        self.status_label.configure(text="Pacote MaxiVloid exportado com sucesso.")
-        messagebox.showinfo("Sucesso", f"Pacote exportado:\n{output_path}", parent=self)
+    ilusr_bytes = None
+    ilusr_nome = ""
+    if uploaded_ilusr is not None:
+        try:
+            with Image.open(uploaded_ilusr) as img_ilusr:
+                if img_ilusr.width > 1280 or img_ilusr.height > 1280:
+                    st.error(
+                        f"Erro: a ilustração deve ter no máximo 1280x1280 pixels; "
+                        f"a imagem possui {img_ilusr.width}x{img_ilusr.height}."
+                    )
+                else:
+                    uploaded_ilusr.seek(0)
+                    ilusr_bytes = uploaded_ilusr.getvalue()
+                    ilusr_nome = uploaded_ilusr.name
+        except UnidentifiedImageError:
+            st.error("A ilustração não é uma imagem válida.")
 
-    def _pitch_changed(self, value):
-        self.pitch_label.configure(text=f"Nota musical: {value:.1f} semitons")
+    with col_dir:
+        st.subheader("Painel de Processamento")
+        p_pitch = st.slider("Ajuste de Nota Musical (Semitons):", -6.0, 6.0, 0.0, 0.5)
+        p_air = st.slider("Ar na Voz Dinâmico:", 0.0, 1.0, 0.0, 0.01)
+        p_formant = st.slider("Timbre do Corpo Vocal:", 0.85, 1.15, 1.00, 0.01)
+        p_gender = st.slider("Transição de Gênero Humano:", 0.80, 1.20, 1.00, 0.01)
+        p_growl = st.slider("Drive Vocal Ventricular:", 0.0, 1.0, 0.0, 0.01)
+        p_naturalness = st.slider("Naturalidade Emocional da Onda:", 0.0, 1.0, 1.0, 0.01)
 
-    def _air_changed(self, value):
-        self.air_label.configure(text=f"Ar na voz: {value * 100:.0f}%")
+        if st.session_state.lista_audios:
+            opcoes = [os.path.basename(name) for name in st.session_state.lista_audios]
+            audio_selecionado = st.selectbox(
+                "Amostra de áudio para pré-visualização:",
+                options=opcoes,
+                index=opcoes.index(st.session_state.audio_selecionado)
+                if st.session_state.audio_selecionado in opcoes
+                else 0,
+            )
+            st.session_state.audio_selecionado = audio_selecionado
 
-    def _formant_changed(self, value):
-        self.formant_label.configure(text=f"Timbre vocal: {value:.2f}x")
+            if st.button("GERAR PRÉ-VISUALIZAÇÃO DE ÁUDIO"):
+                nome_audio = next(
+                    name for name in st.session_state.lista_audios
+                    if os.path.basename(name) == audio_selecionado
+                )
+                try:
+                    with zipfile.ZipFile(io.BytesIO(st.session_state.zip_bytes), "r") as z:
+                        raw_audio = z.read(nome_audio)
+                    preview_processed = processar_audio(
+                        raw_audio,
+                        st.session_state.dados_oto,
+                        audio_selecionado,
+                        p_pitch,
+                        p_air,
+                        p_formant,
+                        p_gender,
+                        p_growl,
+                        p_naturalness,
+                    )
+                    st.audio(preview_processed, format="audio/wav")
+                    st.success(f"Visualização gerada usando a amostra base: {audio_selecionado}")
+                except (KeyError, ValueError, zipfile.BadZipFile) as exc:
+                    st.error(f"Não foi possível processar a amostra: {exc}")
 
-    def _gender_changed(self, value):
-        self.gender_label.configure(text=f"Fator de gênero: {value:.2f}")
+            if st.button("COMPILAR E COMPACTAR PACOTE DE DISTRIBUIÇÃO (.ZIP)"):
+                if not st.session_state.lista_audios:
+                    st.warning("Nenhum áudio foi encontrado no pacote.")
+                elif not nome_ch.strip() or not autor_ch.strip():
+                    st.warning("Informe o nome e o desenvolvedor do character.")
+                else:
+                    with st.spinner("Injetando módulos de configuração no formato MaxiVloid..."):
+                        out_zip_io = io.BytesIO()
+                        conteudo_mxai = [
+                            "[MxAi_Configuration]",
+                            "EngineCompatible=MaximizeVoiceSynthesizerMobile",
+                            "GlobalType=MaxiVloid",
+                            f"GlobalPitchShift={p_pitch:.2f}",
+                            f"GlobalAirRatio={p_air:.2f}",
+                            f"GlobalFormantShift={p_formant:.2f}",
+                            f"GlobalGenderFactor={p_gender:.2f}",
+                            f"GlobalGrowlAmount={p_growl:.2f}",
+                            f"GlobalNaturalness={p_naturalness:.2f}",
+                            "",
+                            "[Amostras_Calibradas]",
+                        ]
+                        for caminho_audio in st.session_state.lista_audios:
+                            nome_arquivo = os.path.basename(caminho_audio)
+                            parametro_consonante = st.session_state.dados_oto.get(
+                                nome_arquivo,
+                                {},
+                            ).get("consonant", "0")
+                            conteudo_mxai.append(
+                                f"{nome_arquivo}=Pitch={p_pitch:.2f},Air={p_air:.2f},"
+                                f"Formant={p_formant:.2f},Gender={p_gender:.2f},"
+                                f"Growl={p_growl:.2f},Naturalness={p_naturalness:.2f},"
+                                f"ProtectConsonant={parametro_consonante}"
+                            )
 
-    def _growl_changed(self, value):
-        self.growl_label.configure(text=f"Growl: {value * 100:.0f}%")
+                        conteudo_txt = [
+                            "type=MaxiVloid",
+                            f"name={nome_ch}",
+                            f"image={ilusr_nome}",
+                            f"author={autor_ch}",
+                            f"icon={icone_nome}",
+                            "version=Maximize_Voice_2.0",
+                        ]
+                        conteudo_yaml = [
+                            "type: MaxiVloid",
+                            f"name: {nome_ch}",
+                            f"author: {autor_ch}",
+                            f"image: {ilusr_nome}",
+                            f"icon: {icone_nome}",
+                            "voice_engine: MaximizeVoiceSynthesizerMobile",
+                        ]
 
-    def _natural_changed(self, value):
-        self.natural_label.configure(text=f"Naturalidade: {value * 100:.0f}%")
+                        with zipfile.ZipFile(out_zip_io, "w", zipfile.ZIP_DEFLATED) as z_out:
+                            z_out.writestr("MxAi.ini", "\n".join(conteudo_mxai) + "\n")
+                            z_out.writestr("character.txt", "\n".join(conteudo_txt) + "\n")
+                            z_out.writestr("character.yaml", "\n".join(conteudo_yaml) + "\n")
+                            if readme_text.strip():
+                                z_out.writestr("README.txt", readme_text)
+                            if icone_bytes:
+                                z_out.writestr(icone_nome, icone_bytes)
+                            if ilusr_bytes:
+                                z_out.writestr(ilusr_nome, ilusr_bytes)
 
-    def _close(self):
-        if winsound is not None:
-            winsound.PlaySound(None, winsound.SND_PURGE)
-        self.preview_dir.cleanup()
-        self.destroy()
+                            with zipfile.ZipFile(io.BytesIO(st.session_state.zip_bytes), "r") as z_in:
+                                for item in z_in.infolist():
+                                    if item.is_dir():
+                                        continue
+                                    nome_base = os.path.basename(item.filename)
+                                    if nome_base.lower() == "oto.ini" or nome_base.lower().endswith(".wav"):
+                                        z_out.writestr(nome_base, z_in.read(item.filename))
+
+                        st.download_button(
+                            label="BAIXAR BANCO DE VOZ COMPILADO MAXIVLOID 🎉",
+                            data=out_zip_io.getvalue(),
+                            file_name="banco_maxivloid_final.zip",
+                            mime="application/zip",
+                        )
+        else:
+            st.info("Aguardando a conclusão das etapas de importação do arquivo no painel esquerdo.")
 
 
-if __name__ == "__main__":
-    app = MvxCreatorApp()
-    app.mainloop()
+col_esq, col_dir = st.columns(2)
+with col_esq:
+    st.title("MVX VoiceBank Creator")
+
+    if st.session_state.tela == 1:
+        _mostrar_tela_importacao()
+    elif st.session_state.tela == 2:
+        _mostrar_tela_validacao()
+    elif st.session_state.tela == 3:
+        st.subheader("Banco de Voz Carregado")
+        st.write(f"Arquivo ZIP: {st.session_state.nome_arquivo_zip}")
+        st.write(f"Áudios encontrados: {len(st.session_state.lista_audios)}")
+        if st.button("VOLTAR PARA IMPORTAÇÃO"):
+            st.session_state.tela = 1
+            st.rerun()
+    else:
+        st.session_state.tela = 1
+
+if st.session_state.tela == 3:
+    _mostrar_tela_processamento()
